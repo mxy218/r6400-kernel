@@ -62,7 +62,23 @@
 #include <linux/blkdev.h>
 #include "../../scsi/sd.h"
 
+/* Foxconn added pling start 02/26/2010, for USB LED */
+#if (defined INCLUDE_USB_LED)   
+/* Foxconn modified start, Wins, 04/11/2011 */
+#if defined(R6300v2) || defined(R7000)
+extern int usb1_pkt_cnt;
+extern int usb2_pkt_cnt;
+extern int usb1_pkt_cnt_smp;
+extern int usb2_pkt_cnt_smp;
+#elif defined(R6250) || defined(R6200v2)
+extern int usb1_pkt_cnt;
+#endif /* R6300v2 */
+#endif
+/* Foxconn added end pling 02/26/2010 */ 
 
+#ifdef CONFIG_BCM47XX
+extern int csw_retry;
+#endif /* CONFIG_BCM47XX */
 /***********************************************************************
  * Data transfer routines
  ***********************************************************************/
@@ -264,6 +280,38 @@ EXPORT_SYMBOL_GPL(usb_stor_clear_halt);
 static int interpret_urb_result(struct us_data *us, unsigned int pipe,
 		unsigned int length, int result, unsigned int partial)
 {
+#ifdef USB_STALL_WAR
+    US_DEBUGP("DISCONNECTING bit is %d\n", test_bit(US_FLIDX_DISCONNECTING, &us->dflags) ? 1 : 0);
+
+    if (us->assoc_time) {
+        if (time_is_before_jiffies(30 * HZ + us->assoc_time)) //R6400v2 CSP#1075538
+            us->assoc_time = 0;
+    }
+	else if (result == -EPIPE) {
+        us->stall_cnt++;
+        if (us->stall_cnt == 1) {
+            us->check_time = jiffies;
+            us->check_stall_cnt = 1;
+        }
+        if (us->stall_cnt == USB_STALL_MAX) {
+            set_bit(US_FLIDX_DISCONNECTING, &us->dflags);
+            printk("%s: set disconnecting bit due to too many stalls\n", __FUNCTION__);
+        }
+    }
+    else if (us->stall_cnt > 0 &&
+        time_is_before_jiffies(10 * HZ + us->check_time)) {
+        if (us->stall_cnt == us->check_stall_cnt)
+            us->stall_cnt = 0;
+        else {
+            us->check_time = jiffies;
+            us->check_stall_cnt = us->stall_cnt;
+        }   
+    }
+
+    US_DEBUGP("result %d stall_cnt %d check_stall_cnt %d\n",
+        result, us->stall_cnt, us->check_stall_cnt);
+#endif /* USB_STALL_WAR */
+
 	US_DEBUGP("Status code %d; transferred %u/%u\n",
 			result, partial, length);
 	switch (result) {
@@ -423,6 +471,38 @@ static int usb_stor_bulk_transfer_sglist(struct us_data *us, unsigned int pipe,
 	/* don't submit s-g requests during abort processing */
 	if (test_bit(US_FLIDX_ABORTING, &us->dflags))
 		return USB_STOR_XFER_ERROR;
+
+	/* Foxconn added pling start 02/26/2010, for USB LED */
+#if 1
+#if (defined INCLUDE_USB_LED)    
+    /* Foxconn modified start, Wins, 04/11/2011 */
+#if defined(R6300v2) || defined(R7000)
+    char devpath[4];
+    memcpy(devpath, us->pusb_dev->devpath, 3);
+    devpath[3] = '\0';
+#if defined(R7000)
+    if (!strcmp(devpath, "1"))
+    {
+        usb1_pkt_cnt++;
+        usb1_pkt_cnt_smp++;
+    }
+    else if (!strcmp(devpath, "2"))
+    {
+        usb2_pkt_cnt++;
+        usb2_pkt_cnt_smp++;
+    }
+#endif        
+#if defined(R6300v2)
+    if (!strcmp(devpath, "1.1"))
+        usb1_pkt_cnt++;
+    else if (!strcmp(devpath, "1.2"))
+        usb2_pkt_cnt++;
+#endif        
+#endif /* R6300v2 */
+    /* Foxconn modified end, Wins, 04/11/2011 */
+#endif
+#endif
+    /* Foxconn added end pling 02/26/2010 */ 
 
 	/* initialize the scatter-gather request block */
 	US_DEBUGP("%s: xfer %u bytes, %d entries\n", __func__,
@@ -700,7 +780,6 @@ Retry_Sense:
 
 		scsi_eh_prep_cmnd(srb, &ses, NULL, 0, sense_size);
 
-		/* FIXME: we must do the protocol translation here */
 		if (us->subclass == US_SC_RBC || us->subclass == US_SC_SCSI ||
 				us->subclass == US_SC_CYP_ATACB)
 			srb->cmd_len = 6;
@@ -1027,6 +1106,9 @@ int usb_stor_Bulk_transport(struct scsi_cmnd *srb, struct us_data *us)
 	int fake_sense = 0;
 	unsigned int cswlen;
 	unsigned int cbwlen = US_BULK_CB_WRAP_LEN;
+#ifdef CONFIG_BCM47XX
+	int retry = csw_retry;
+#endif /* CONFIG_BCM47XX */
 
 	/* Take care of BULK32 devices; set extra byte to 0 */
 	if (unlikely(us->fflags & US_FL_BULK32)) {
@@ -1091,6 +1173,10 @@ int usb_stor_Bulk_transport(struct scsi_cmnd *srb, struct us_data *us)
 	 * an explanation of how this code works.
 	 */
 
+#ifdef CONFIG_BCM47XX
+	memset(bcs, 0, sizeof(struct bulk_cs_wrap));
+#endif /* CONFIG_BCM47XX */
+
 	/* get CSW for device status */
 	US_DEBUGP("Attempting to get CSW...\n");
 	result = usb_stor_bulk_transfer_buf(us, us->recv_bulk_pipe,
@@ -1119,6 +1205,25 @@ int usb_stor_Bulk_transport(struct scsi_cmnd *srb, struct us_data *us)
 	US_DEBUGP("Bulk status result = %d\n", result);
 	if (result != USB_STOR_XFER_GOOD)
 		return USB_STOR_TRANSPORT_ERROR;
+
+#ifdef CONFIG_BCM47XX
+	while (retry && (bcs->Signature == 0) && (cswlen == US_BULK_CS_WRAP_LEN)) {
+		retry--;
+		mdelay(1);
+	}
+
+	if (retry != csw_retry) {
+		US_DEBUGP("retry = %d\n", retry);
+
+		if (retry == 0) {
+			US_DEBUGP("CSW: us->S 0x%x us->T 0x%x S 0x%x T 0x%x R %u Stat 0x%x\n",
+				le32_to_cpu(us->bcs_signature), us->tag,
+				le32_to_cpu(bcs->Signature), bcs->Tag,
+				residue, bcs->Status);
+			return USB_STOR_TRANSPORT_GOOD;
+		}
+	}
+#endif /* CONFIG_BCM47XX */
 
 	/* check bulk status */
 	residue = le32_to_cpu(bcs->Residue);

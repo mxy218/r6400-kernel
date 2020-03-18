@@ -1,3 +1,4 @@
+/* Modified by Broadcom Corp. Portions Copyright (c) Broadcom Corp, 2012. */
 /*
  * include/linux/irqflags.h
  *
@@ -12,6 +13,8 @@
 #define _LINUX_TRACE_IRQFLAGS_H
 
 #include <linux/typecheck.h>
+
+#undef CONFIG_TRACE_IRQFLAGS
 
 #ifdef CONFIG_TRACE_IRQFLAGS
   extern void trace_softirqs_on(unsigned long ip);
@@ -43,8 +46,7 @@
 # define INIT_TRACE_IRQFLAGS
 #endif
 
-#if defined(CONFIG_IRQSOFF_TRACER) || \
-	defined(CONFIG_PREEMPT_TRACER)
+#if defined(CONFIG_IRQSOFF_TRACER) || defined(CONFIG_PREEMPT_TRACER)
  extern void stop_critical_timings(void);
  extern void start_critical_timings(void);
 #else

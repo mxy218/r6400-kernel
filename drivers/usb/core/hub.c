@@ -31,6 +31,7 @@
 
 #include "usb.h"
 
+#define DOWNGRADE_USB3_HUB
 /* if we are in debug mode, always announce new devices */
 #ifdef DEBUG
 #ifndef CONFIG_USB_ANNOUNCE_NEW_DEVICES
@@ -63,7 +64,7 @@ struct usb_hub {
 							resumed */
 	unsigned long		removed_bits[1]; /* ports with a "removed"
 							device present */
-#if USB_MAXCHILDREN > 31 /* 8*sizeof(unsigned long) - 1 */
+#if USB_MAXCHILDREN > 31     /* 8*sizeof(unsigned long) - 1 */
 #error event_bits[] is too short!
 #endif
 
@@ -81,8 +82,15 @@ struct usb_hub {
 	struct delayed_work	leds;
 	struct delayed_work	init_work;
 	void			**port_owners;
+#ifdef DOWNGRADE_USB3_HUB
+	u32			pp_off_ports;	/* port power turned off on which ports */
+#endif /* DOWNGRADE_USB3_HUB */
 };
 
+#ifdef DOWNGRADE_USB3_HUB
+#define DOWNGRADE_DELAY	(5 * HZ)
+static struct delayed_work pp_work;	/* port power work */
+#endif /* DOWNGRADE_USB3_HUB */
 
 /* Protect struct usb_device->state and ->children members
  * Note: Both are also protected by ->dev.sem, except that ->state can
@@ -522,7 +530,6 @@ int usb_hub_clear_tt_buffer(struct urb *urb)
 	 */
 	if ((clear = kmalloc (sizeof *clear, GFP_ATOMIC)) == NULL) {
 		dev_err (&udev->dev, "can't save CLEAR_TT_BUFFER state\n");
-		/* FIXME recover somehow ... RESET_TT? */
 		return -ENOMEM;
 	}
 
@@ -626,14 +633,6 @@ static void hub_port_logical_disconnect(struct usb_hub *hub, int port1)
 	dev_dbg(hub->intfdev, "logical disconnect on port %d\n", port1);
 	hub_port_disable(hub, port1, 1);
 
-	/* FIXME let caller ask to power down the port:
-	 *  - some devices won't enumerate without a VBUS power cycle
-	 *  - SRP saves power that way
-	 *  - ... new call, TBD ...
-	 * That's easy if this hub can switch power per-port, and
-	 * khubd reactivates the port later (timer, SRP, etc).
-	 * Powerdown must be optional, because of reset/DFU.
-	 */
 
 	set_bit(port1, hub->change_bits);
  	kick_khubd(hub);
@@ -766,13 +765,6 @@ static void hub_activate(struct usb_hub *hub, enum hub_activation_type type)
 				!(portstatus & USB_PORT_STAT_CONNECTION) ||
 				!udev ||
 				udev->state == USB_STATE_NOTATTACHED)) {
-			/*
-			 * USB3 protocol ports will automatically transition
-			 * to Enabled state when detect an USB3.0 device attach.
-			 * Do not disable USB3 protocol ports.
-			 * FIXME: USB3 root hub and external hubs are treated
-			 * differently here.
-			 */
 			if (hdev->descriptor.bDeviceProtocol != 3 ||
 			    (!hdev->parent &&
 			     !(portstatus & USB_PORT_STAT_SUPER_SPEED))) {
@@ -1127,8 +1119,6 @@ static int hub_configure(struct usb_hub *hub,
 			hub->mA_per_port = 100;		/* 7.2.1.1 */
 		}
 	} else {	/* Self-powered external hub */
-		/* FIXME: What about battery-powered external hubs that
-		 * provide less current per port? */
 		hub->mA_per_port = 500;
 	}
 	if (hub->mA_per_port < 500)
@@ -1240,6 +1230,87 @@ static void hub_disconnect(struct usb_interface *intf)
 
 	kref_put(&hub->kref, hub_release);
 }
+
+#ifdef DOWNGRADE_USB3_HUB
+static void pp_work_func(struct work_struct *ws)
+{
+	struct usb_hub *hub;
+	struct usb_device *hdev;
+	struct usb_bus *bus;
+	struct usb_hcd *hcd;
+	u32 usb3_pp_off_ports, usb3_resume_pp_ports, pe_ports;
+	u16 portstatus, portchange;
+	int i, portnum;
+
+	usb3_pp_off_ports = usb3_resume_pp_ports = pe_ports = 0;
+
+	mutex_lock(&usb_bus_list_lock);
+
+	list_for_each_entry(bus, &usb_bus_list, bus_list) {
+		if (!bus->root_hub)
+			continue;
+
+		hdev = bus->root_hub;
+		usb_lock_device(hdev);
+		hcd = bus_to_hcd(bus);
+		hub = hdev_to_hub(hdev);
+		/* get USB3 PP off ports */
+		if (hcd->driver->flags & HCD_USB3) {
+			usb3_pp_off_ports = hub->pp_off_ports;
+		}
+
+		/* get the ports in enabled state */
+		for (i = 0; i < hdev->maxchild; i++) {
+			portnum = i + 1;
+			portstatus = portchange = 0;
+			if (hub_port_status(hub, portnum, &portstatus, &portchange))
+				continue;
+
+			if (portstatus & USB_PORT_STAT_ENABLE) {
+				pe_ports |= (1 << portnum);
+			}
+		}
+		usb_unlock_device(hdev);
+	}
+
+	usb3_resume_pp_ports = usb3_pp_off_ports & ~pe_ports;
+
+	/* no ports need to be resumed PP */
+	if (!usb3_resume_pp_ports)
+		goto out;
+
+	list_for_each_entry(bus, &usb_bus_list, bus_list) {
+		if (!bus->root_hub)
+			continue;
+
+		hdev = bus->root_hub;
+		usb_lock_device(hdev);
+		hcd = bus_to_hcd(bus);
+		hub = hdev_to_hub(hdev);
+		if (!(hcd->driver->flags & HCD_USB3)) {
+			usb_unlock_device(hdev);
+			continue;
+		}
+
+		for (i = 0; (i < hdev->maxchild) && (usb3_resume_pp_ports != 0); i++) {
+			portnum = i + 1;
+			if (!(usb3_resume_pp_ports & (1 << portnum)))
+				continue;
+
+			/* enable port power on usb3 port */
+			printk("%s resume USB3 PP on port %d\n", __FUNCTION__, portnum);
+			set_port_feature(hdev, portnum, USB_PORT_FEAT_POWER);
+			hub->pp_off_ports &= ~(1 << portnum);
+			usb3_resume_pp_ports &= ~(1 << portnum);
+		}
+		usb_unlock_device(hdev);
+		break;
+	}
+
+out:
+	mutex_unlock(&usb_bus_list_lock);
+}
+#endif /* DOWNGRADE_USB3_HUB */
 
 static int hub_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
@@ -1617,6 +1688,14 @@ void usb_disconnect(struct usb_device **pdev)
 	usb_hcd_synchronize_unlinks(udev);
 
 	usb_remove_ep_devs(&udev->ep0);
+
+#ifdef DOWNGRADE_USB3_HUB
+	if (udev->parent && !udev->parent->parent &&
+		(udev->descriptor.bDeviceClass == USB_CLASS_HUB)) {
+		schedule_delayed_work(&pp_work, DOWNGRADE_DELAY);
+	}
+#endif /* DOWNGRADE_USB3_HUB */
+
 	usb_unlock_device(udev);
 
 	/* Unregister the device.  The device driver is responsible
@@ -1670,12 +1749,6 @@ static inline void announce_device(struct usb_device *udev) { }
 #include "otg_whitelist.h"
 #endif
 
-/**
- * usb_enumerate_device_otg - FIXME (usbcore-internal)
- * @udev: newly addressed device (in ADDRESS state)
- *
- * Finish enumeration for On-The-Go devices
- */
 static int usb_enumerate_device_otg(struct usb_device *udev)
 {
 	int err = 0;
@@ -1746,18 +1819,6 @@ fail:
 }
 
 
-/**
- * usb_enumerate_device - Read device configs/intfs/otg (usbcore-internal)
- * @udev: newly addressed device (in ADDRESS state)
- *
- * This is only called by usb_new_device() and usb_authorize_device()
- * and FIXME -- all comments that apply to them apply here wrt to
- * environment.
- *
- * If the device is WUSB and not authorized, we don't attempt to read
- * the string descriptors, as they will be errored out by the device
- * until it has been authorized.
- */
 static int usb_enumerate_device(struct usb_device *udev)
 {
 	int err;
@@ -2074,7 +2135,6 @@ static int hub_port_reset(struct usb_hub *hub, int port1,
 		case -ENODEV:
 			clear_port_feature(hub->hdev,
 				port1, USB_PORT_FEAT_C_RESET);
-			/* FIXME need disconnect() for NOTATTACHED device */
 			usb_set_device_state(udev, status
 					? USB_STATE_NOTATTACHED
 					: USB_STATE_DEFAULT);
@@ -2676,7 +2736,6 @@ hub_port_init (struct usb_hub *hub, struct usb_device *udev, int port1,
 		usb_set_device_state(udev, USB_STATE_DEFAULT);
 	} else {
 		/* Reset the device; full speed may morph to high speed */
-		/* FIXME a USB 2.0 device may morph into SuperSpeed on reset. */
 		retval = hub_port_reset(hub, port1, udev, delay);
 		if (retval < 0)		/* error or disconnect */
 			goto fail;
@@ -3108,14 +3167,6 @@ static void hub_port_connect_change(struct usb_hub *hub, int port1,
 		udev->level = hdev->level + 1;
 		udev->wusb = hub_is_wusb(hub);
 
-		/*
-		 * USB 3.0 devices are reset automatically before the connect
-		 * port status change appears, and the root hub port status
-		 * shows the correct speed.  We also get port change
-		 * notifications for USB 3.0 devices from the USB 3.0 portion of
-		 * an external USB 3.0 hub, but this isn't handled correctly yet
-		 * FIXME.
-		 */
 
 		if (!(hcd->driver->flags & HCD_USB3))
 			udev->speed = USB_SPEED_UNKNOWN;
@@ -3146,6 +3197,19 @@ static void hub_port_connect_change(struct usb_hub *hub, int port1,
 		usb_detect_quirks(udev);
 		if (udev->quirks & USB_QUIRK_DELAY_INIT)
 			msleep(1000);
+
+#ifdef DOWNGRADE_USB3_HUB
+		/* disable usb3 port power when detects a usb3 hub */
+		if ((udev->speed == USB_SPEED_SUPER) &&
+			(udev->descriptor.bDeviceClass == USB_CLASS_HUB)) {
+			printk("Turn off USB3 port %d PP\n", port1);
+			clear_port_feature(hdev, port1, USB_PORT_FEAT_POWER);
+			hub->pp_off_ports |= (1 << port1);
+			schedule_delayed_work(&pp_work, DOWNGRADE_DELAY);
+			status = -ENOTCONN;
+			goto loop;
+		}
+#endif /* DOWNGRADE_USB3_HUB */
 
 		/* consecutive bus-powered hubs aren't reliable; they can
 		 * violate the voltage drop budget.  if the new child has
@@ -3432,7 +3496,6 @@ static void hub_events(void)
 				dev_dbg (hub_dev, "power change\n");
 				clear_hub_feature(hdev, C_HUB_LOCAL_POWER);
 				if (hubstatus & HUB_STATUS_LOCAL_POWER)
-					/* FIXME: Is this always true? */
 					hub->limited_power = 1;
 				else
 					hub->limited_power = 0;
@@ -3512,6 +3575,10 @@ int usb_hub_init(void)
 		return -1;
 	}
 
+#ifdef DOWNGRADE_USB3_HUB
+	INIT_DELAYED_WORK(&pp_work, pp_work_func);
+#endif /* DOWNGRADE_USB3_HUB */
+
 	khubd_task = kthread_run(hub_thread, NULL, "khubd");
 	if (!IS_ERR(khubd_task))
 		return 0;
@@ -3535,6 +3602,10 @@ void usb_hub_cleanup(void)
 	 * individual hub resources. -greg
 	 */
 	usb_deregister(&hub_driver);
+#ifdef DOWNGRADE_USB3_HUB
+	cancel_delayed_work_sync(&pp_work);
+#endif /* DOWNGRADE_USB3_HUB */
+
 } /* usb_hub_cleanup() */
 
 static int descriptors_changed(struct usb_device *udev,

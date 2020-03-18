@@ -2549,20 +2549,6 @@ static int ip_route_output_slow(struct net *net, struct rtable **rp,
 			if (dev_out == NULL)
 				goto out;
 
-			/* Special hack: user can direct multicasts
-			   and limited broadcast via necessary interface
-			   without fiddling with IP_MULTICAST_IF or IP_PKTINFO.
-			   This hack is not just for fun, it allows
-			   vic,vat and friends to work.
-			   They bind socket to loopback, set ttl to zero
-			   and expect that it will work.
-			   From the viewpoint of routing cache they are broken,
-			   because we are not allowed to build multicast path
-			   with loopback source addr (look, routing cache
-			   cannot know, that ttl is zero, so that packet
-			   will not leave this host and route is valid).
-			   Luckily, this hack is good workaround.
-			 */
 
 			fl.oif = dev_out->ifindex;
 			goto make_route;
@@ -3322,6 +3308,15 @@ int __init ip_rt_init(void)
 				  SLAB_HWCACHE_ALIGN|SLAB_PANIC, NULL);
 
 	ipv4_dst_blackhole_ops.kmem_cachep = ipv4_dst_ops.kmem_cachep;
+
+	/* Foxconn added start pling 04/16/2014 */
+	/* Increase max number of dst_entry, for ACOS NAT
+	 *  to hold 65536 connections.
+	 *  ps. original value is 2048 */
+#if (defined CONFIG_NAT_65536_SESSION)
+	rhash_entries = 8192;
+#endif
+	/* Foxconn added end pling 04/16/2014 */
 
 	rt_hash_table = (struct rt_hash_bucket *)
 		alloc_large_system_hash("IP route cache",

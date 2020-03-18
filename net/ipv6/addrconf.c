@@ -148,6 +148,9 @@ static void addrconf_dad_start(struct inet6_ifaddr *ifp, u32 flags);
 static void addrconf_dad_timer(unsigned long data);
 static void addrconf_dad_completed(struct inet6_ifaddr *ifp);
 static void addrconf_dad_run(struct inet6_dev *idev);
+/*Foxconn tab tseng add start, 2013/07/23, for dhcp6c wan DAD */
+static struct proc_dir_entry *ipv6_wan_DAD_flag;
+/*Foxconn tab tseng add end, 2013/07/23, for dhcp6c wan DAD */
 static void addrconf_rs_timer(unsigned long data);
 static void __ipv6_ifa_notify(int event, struct inet6_ifaddr *ifa);
 static void ipv6_ifa_notify(int event, struct inet6_ifaddr *ifa);
@@ -441,7 +444,7 @@ static struct inet6_dev * ipv6_add_dev(struct net_device *dev)
 	return ndev;
 }
 
-static struct inet6_dev * ipv6_find_idev(struct net_device *dev)
+/*static*/ struct inet6_dev * ipv6_find_idev(struct net_device *dev)
 {
 	struct inet6_dev *idev;
 
@@ -458,6 +461,7 @@ static struct inet6_dev * ipv6_find_idev(struct net_device *dev)
 		ipv6_mc_up(idev);
 	return idev;
 }
+EXPORT_SYMBOL(ipv6_find_idev);
 
 #ifdef CONFIG_SYSCTL
 static void dev_forward_change(struct inet6_dev *idev)
@@ -614,7 +618,7 @@ ipv6_add_addr(struct inet6_dev *idev, const struct in6_addr *addr, int pfxlen,
 
 	rcu_read_lock_bh();
 	if (idev->dead) {
-		err = -ENODEV;			/*XXX*/
+		err = -ENODEV;
 		goto out2;
 	}
 
@@ -864,7 +868,7 @@ retry:
 	}
 	spin_lock_bh(&ifp->lock);
 	if (ifp->regen_count++ >= idev->cnf.regen_max_retry) {
-		idev->cnf.use_tempaddr = -1;	/*XXX*/
+		idev->cnf.use_tempaddr = -1;
 		spin_unlock_bh(&ifp->lock);
 		write_unlock(&idev->lock);
 		printk(KERN_WARNING
@@ -1377,6 +1381,33 @@ struct inet6_ifaddr *ipv6_get_ifaddr(struct net *net, const struct in6_addr *add
 
 /* Gets referenced address, destroys ifaddr */
 
+/* Foxconn added start pling 10/27/2009 */
+extern const char lan_if_name[];
+extern const char wan_if_name[];
+extern int lan_dad_detected;
+extern int wan_dad_detected;
+/* Foxconn added end pling 10/27/2009 */
+/*Foxconn tab tseng added, 2013/07/23, for dhcp6c wan ipv6 DAD*/
+/*
+ * Create "/proc/net/ipv6_wan_DAD_detected" entry
+ */
+int ipv6_read_wan_DAD_stats(char *buffer, char **start, off_t offset, int length, int *eof, void *data)
+{
+    int len = 0;
+    char temp[8];
+    memset(temp, 0, sizeof(temp));
+    buffer[0] = '\0';    
+    sprintf(temp,"%d",wan_dad_detected);
+    strcat(buffer, temp);
+    len += strlen(buffer) + 1;
+    *eof = 1;
+    return len;    
+}
+/*Foxconn tab tseng added, 2013/07/23, for dhcp6c wan ipv6 DAD*/
+/* Foxconn added start pling 11/29/2010 */
+static struct in6_addr dad_wan_ip_addr;
+/* Foxconn added end pling 11/29/2010 */
+
 static void addrconf_dad_stop(struct inet6_ifaddr *ifp, int dad_failed)
 {
 	if (ifp->flags&IFA_F_PERMANENT) {
@@ -1389,6 +1420,34 @@ static void addrconf_dad_stop(struct inet6_ifaddr *ifp, int dad_failed)
 		if (dad_failed)
 			ipv6_ifa_notify(0, ifp);
 		in6_ifa_put(ifp);
+
+        /* Foxconn modified start pling 08/16/2010 */
+        /* Disable IPv6 forwarding if DAD is detected */
+		if (strcmp(ifp->idev->dev->name, lan_if_name) == 0)
+        {
+            ipv6_devconf.forwarding = 0;
+            ifp->idev->cnf.forwarding = 0;
+			lan_dad_detected = 1;
+        }
+		else if (strcmp(ifp->idev->dev->name, wan_if_name) == 0)
+        {
+            ipv6_devconf.forwarding = 0;
+            ifp->idev->cnf.forwarding = 0;
+			wan_dad_detected = 1;
+
+			/* Foxconn added start pling 11/29/2010 */
+			/* WNR3500L TD175: After duplicate IP detected,
+			 * kernel can't send NS anymore. So for subsequent IPv6 
+			 * assignment from RA/DHCPv6 server, router can't
+			 * do DAD correctly.
+			 * Current workaround: save the DAD IP. When DHCPv6 client
+			 * later remove this IPv6 address, clear the DAD flag.
+			 */
+			memcpy(&dad_wan_ip_addr, &(ifp->addr), sizeof(dad_wan_ip_addr));
+			/* Foxconn added end pling 11/29/2010 */
+        }
+        /* Foxconn modifed end pling 08/16/2010 */
+
 #ifdef CONFIG_IPV6_PRIVACY
 	} else if (ifp->flags&IFA_F_TEMPORARY) {
 		struct inet6_ifaddr *ifpub;
@@ -1527,7 +1586,6 @@ static int addrconf_ifid_eui48(u8 *eui, struct net_device *dev)
 
 static int addrconf_ifid_arcnet(u8 *eui, struct net_device *dev)
 {
-	/* XXX: inherit EUI-64 from other interface -- yoshfuji */
 	if (dev->addr_len != ARCNET_ALEN)
 		return -1;
 	memset(eui, 0, 7);
@@ -1611,17 +1669,6 @@ regen:
 	get_random_bytes(idev->rndid, sizeof(idev->rndid));
 	idev->rndid[0] &= ~0x02;
 
-	/*
-	 * <draft-ietf-ipngwg-temp-addresses-v2-00.txt>:
-	 * check if generated address is not inappropriate
-	 *
-	 *  - Reserved subnet anycast (RFC 2526)
-	 *	11111101 11....11 1xxxxxxx
-	 *  - ISATAP (RFC4214) 6.1
-	 *	00-00-5E-FE-xx-xx-xx-xx
-	 *  - value 0
-	 *  - XXX: already assigned to an address on the device
-	 */
 	if (idev->rndid[0] == 0xfd &&
 	    (idev->rndid[1]&idev->rndid[2]&idev->rndid[3]&idev->rndid[4]&idev->rndid[5]&idev->rndid[6]) == 0xff &&
 	    (idev->rndid[7]&0x80))
@@ -2209,6 +2256,24 @@ static int inet6_addr_del(struct net *net, int ifindex, struct in6_addr *pfx,
 			read_unlock_bh(&idev->lock);
 
 			ipv6_del_addr(ifp);
+
+			/* Foxconn added start pling 11/29/2010 */
+			/* WNR3500L TD175:
+			 * When an IPv6 address is removed from a interface,
+			 * check whether this addr causes DAD before.
+			 * If yes, clear the DAD flag as well.
+			 */
+			if (strcmp(ifp->idev->dev->name, wan_if_name) == 0) {
+				if (memcmp(&(ifp->addr), &dad_wan_ip_addr, 
+							sizeof(dad_wan_ip_addr)) == 0) {
+					/* Clear DAD flag, and restore forwarding */
+					wan_dad_detected = 0;
+				    ipv6_devconf.forwarding = 1;
+					ifp->idev->cnf.forwarding = 1;
+					printk(KERN_EMERG "Remove DAD for WAN\n");
+				}
+			}
+			/* Foxconn added end pling 11/29/2010 */
 
 			/* If the last address is deleted administratively,
 			   disable IPv6 on this interface.
@@ -3944,7 +4009,6 @@ static int inet6_fill_ifinfo(struct sk_buff *skb, struct inet6_dev *idev,
 		goto nla_put_failure;
 	ipv6_store_devconf(&idev->cnf, nla_data(nla), nla_len(nla));
 
-	/* XXX - MC not implemented */
 
 	nla = nla_reserve(skb, IFLA_INET6_STATS, IPSTATS_MIB_MAX * sizeof(u64));
 	if (nla == NULL)
@@ -4632,7 +4696,14 @@ EXPORT_SYMBOL(unregister_inet6addr_notifier);
 int __init addrconf_init(void)
 {
 	int i, err;
-
+        /*Foxconn tab tseng added, 2013/07/23, for dhcp6c wan ipv6 DAD*/
+        ipv6_wan_DAD_flag= create_proc_entry("ipv6_wan_DAD_detected",0,NULL);         
+        if (ipv6_wan_DAD_flag == NULL) {
+		printk(KERN_EMERG "Error: Could not initialize /proc/\n");
+	}else{
+            ipv6_wan_DAD_flag->read_proc = ipv6_read_wan_DAD_stats;
+        }
+        /*Foxconn tab tseng added end, 2013/07/23, for dhcp6c wan ipv6 DAD*/
 	err = ipv6_addr_label_init();
 	if (err < 0) {
 		printk(KERN_CRIT "IPv6 Addrconf:"
@@ -4730,3 +4801,33 @@ void addrconf_cleanup(void)
 	del_timer(&addr_chk_timer);
 	rtnl_unlock();
 }
+
+/* Foxconn added start pling 08/16/2010 */
+int restore_ipv6_forwarding(struct net_device *dev)
+{
+    struct inet6_dev *idev;
+    idev = ipv6_find_idev(dev);
+    if (idev)
+    {
+        ipv6_devconf.forwarding = 1;
+        idev->cnf.forwarding = 1;
+    }
+
+    return 0;
+}
+/* Foxconn added end pling 08/16/2010 */
+
+/* Foxconn added start 11/21/2014 */
+/* Export a function for IPv6 DNS hijack to use, to avoid kernel message */
+struct inet6_dev * ipv6_find_idev2(struct net_device *dev)
+{   
+    struct inet_dev *idev;
+
+    rtnl_lock();
+    idev = ipv6_find_idev(dev);
+    rtnl_unlock();
+
+    return idev;
+}
+EXPORT_SYMBOL(ipv6_find_idev2);
+/* Foxconn added end 11/21/2014 */

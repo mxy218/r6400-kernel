@@ -1,3 +1,4 @@
+/* Modified by Broadcom Corp. Portions Copyright (c) Broadcom Corp, 2012. */
 /*
  * if_ppp.h - Point-to-Point Protocol definitions.
  *
@@ -168,6 +169,11 @@ struct pppol2tp_ioc_stats {
 
 #if !defined(ifr_mtu)
 #define ifr_mtu	ifr_ifru.ifru_metric
+#endif
+
+#ifdef CTF_PPPOE
+extern void ppp_rxstats_upd(void *pppif, struct sk_buff *skb);
+extern void ppp_txstats_upd(void *pppif, struct sk_buff *skb);
 #endif
 
 #endif /* _IF_PPP_H_ */

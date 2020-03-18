@@ -2010,7 +2010,11 @@ bool blk_update_request(struct request *req, int error, unsigned int nr_bytes)
 		req->errors = 0;
 
 	if (error && req->cmd_type == REQ_TYPE_FS &&
-	    !(req->cmd_flags & REQ_QUIET)) {
+	    !(req->cmd_flags & REQ_QUIET) 
+#ifdef USB_STALL_WAR		
+		&& printk_ratelimit()
+#endif		
+		) {
 		printk(KERN_ERR "end_request: I/O error, dev %s, sector %llu\n",
 				req->rq_disk ? req->rq_disk->disk_name : "?",
 				(unsigned long long)blk_rq_pos(req));

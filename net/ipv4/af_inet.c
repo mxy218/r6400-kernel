@@ -117,6 +117,8 @@
 #include <linux/mroute.h>
 #endif
 
+#include <typedefs.h>
+#include <bcmdefs.h>
 
 /* The inetsw table contains everything that inet_create needs to
  * build a new socket.
@@ -856,8 +858,15 @@ int inet_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 	case SIOCDARP:
 	case SIOCGARP:
 	case SIOCSARP:
+    case SIOCPIDARP:   //Foxconn tab tsng add, 2013/05/23 ,ioctl pid to arp
 		err = arp_ioctl(net, cmd, (void __user *)arg);
 		break;
+/*foxconn add start,edward zhang, 2012/11/16 @arp protection*/
+#ifdef ARP_PROTECTION
+	case SIOCREJARP:
+		return arp_ioctl(net, cmd, (void __user *)arg);
+#endif
+/*foxconn add end,edward zhang, 2012/11/16 @arp protection*/
 	case SIOCGIFADDR:
 	case SIOCSIFADDR:
 	case SIOCGIFBRDADDR:
@@ -1119,14 +1128,6 @@ static int inet_sk_reselect_saddr(struct sock *sk)
 
 	inet->inet_saddr = inet->inet_rcv_saddr = new_saddr;
 
-	/*
-	 * XXX The only one ugly spot where we need to
-	 * XXX really change the sockets identity after
-	 * XXX it has entered the hashes. -DaveM
-	 *
-	 * Besides that, it does not check for connection
-	 * uniqueness. Wait for troubles.
-	 */
 	__sk_prot_rehash(sk);
 	return 0;
 }
@@ -1225,7 +1226,7 @@ out:
 	return err;
 }
 
-static struct sk_buff *inet_gso_segment(struct sk_buff *skb, int features)
+static struct sk_buff * BCMFASTPATH_HOST inet_gso_segment(struct sk_buff *skb, int features)
 {
 	struct sk_buff *segs = ERR_PTR(-EINVAL);
 	struct iphdr *iph;
@@ -1293,7 +1294,7 @@ out:
 	return segs;
 }
 
-static struct sk_buff **inet_gro_receive(struct sk_buff **head,
+static struct sk_buff ** BCMFASTPATH_HOST inet_gro_receive(struct sk_buff **head,
 					 struct sk_buff *skb)
 {
 	const struct net_protocol *ops;
@@ -1371,7 +1372,7 @@ out:
 	return pp;
 }
 
-static int inet_gro_complete(struct sk_buff *skb)
+static int BCMFASTPATH_HOST inet_gro_complete(struct sk_buff *skb)
 {
 	const struct net_protocol *ops;
 	struct iphdr *iph = ip_hdr(skb);
@@ -1769,4 +1770,3 @@ static int __init ipv4_proc_init(void)
 #endif /* CONFIG_PROC_FS */
 
 MODULE_ALIAS_NETPROTO(PF_INET);
-

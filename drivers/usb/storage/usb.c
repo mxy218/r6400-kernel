@@ -73,6 +73,12 @@
 #include "sierra_ms.h"
 #include "option_ms.h"
 
+#ifdef CONFIG_BCM47XX
+#include <bcmnvram.h>
+
+int csw_retry = 100;
+#endif /* CONFIG_BCM47XX */
+
 /* Some informational data */
 MODULE_AUTHOR("Matthew Dharm <mdharm-usb@one-eyed-alien.net>");
 MODULE_DESCRIPTION("USB Mass Storage driver for Linux");
@@ -130,7 +136,7 @@ static struct us_unusual_dev us_unusual_dev_list[] = {
 #undef USUAL_DEV
 
 
-#ifdef CONFIG_PM	/* Minimal support for suspend and resume */
+#ifdef CONFIG_PM	    /* Minimal support for suspend and resume */
 
 int usb_stor_suspend(struct usb_interface *iface, pm_message_t message)
 {
@@ -175,8 +181,6 @@ int usb_stor_reset_resume(struct usb_interface *iface)
 	/* Report the reset to the SCSI core */
 	usb_stor_report_bus_reset(us);
 
-	/* FIXME: Notify the subdrivers that they need to reinitialize
-	 * the device */
 	return 0;
 }
 EXPORT_SYMBOL_GPL(usb_stor_reset_resume);
@@ -209,8 +213,6 @@ int usb_stor_post_reset(struct usb_interface *iface)
 	/* Report the reset to the SCSI core */
 	usb_stor_report_bus_reset(us);
 
-	/* FIXME: Notify the subdrivers that they need to reinitialize
-	 * the device */
 
 	mutex_unlock(&us->dev_mutex);
 	return 0;
@@ -895,7 +897,10 @@ int usb_stor_probe1(struct us_data **pus,
 	init_completion(&(us->notify));
 	init_waitqueue_head(&us->delay_wait);
 	init_completion(&us->scanning_done);
-
+	
+#ifdef USB_STALL_WAR
+       us->assoc_time = jiffies;
+#endif /* USB_STALL_WAR */
 	/* Associate the us_data structure with the USB device */
 	result = associate_dev(us, intf);
 	if (result)
@@ -1050,6 +1055,15 @@ static struct usb_driver usb_storage_driver = {
 static int __init usb_stor_init(void)
 {
 	int retval;
+
+#ifdef CONFIG_BCM47XX
+	do {
+		char *p;
+		if ((p = nvram_get("csw_retry")) != NULL)
+			csw_retry = simple_strtoul(p, NULL, 0);
+		printk("csw_retry %d\n", csw_retry);
+	} while (0);
+#endif /* CONFIG_BCM47XX */
 
 	pr_info("Initializing USB Mass Storage driver...\n");
 

@@ -12,12 +12,11 @@
  * bit of memory.  Use nr_cpu_ids instead of this except for static bitmaps.
  */
 #ifndef CONFIG_NR_CPUS
-/* FIXME: This should be fixed in the arch's Kconfig */
-#define CONFIG_NR_CPUS	1
+#define CONFIG_NR_CPUS  2
 #endif
 
 /* Places which use this should consider cpumask_var_t. */
-#define NR_CPUS		CONFIG_NR_CPUS
+#define NR_CPUS     CONFIG_NR_CPUS
 
 #define MIN_THREADS_LEFT_FOR_ROOT 4
 

@@ -30,6 +30,7 @@
 #include <linux/backing-dev.h>
 #include <linux/compat.h>
 #include <linux/mount.h>
+#include <linux/time.h>
 
 #include <linux/mtd/mtd.h>
 #include <linux/mtd/map.h>
@@ -38,7 +39,10 @@
 
 #define MTD_INODE_FS_MAGIC 0x11307854
 static struct vfsmount *mtd_inode_mnt __read_mostly;
-
+/* added start, James Hsu, 2016/10/20 for Router Analytics kernel reboot timestampe with correct timezone */
+int AWS_timezone=0;
+EXPORT_SYMBOL(AWS_timezone);
+/* added start, James Hsu, 2016/10/20 */
 /*
  * Data structure to hold the pointer to the mtd device as well
  * as mode information ofr various use cases.
@@ -164,9 +168,6 @@ static int mtd_close(struct inode *inode, struct file *file)
 	return 0;
 } /* mtd_close */
 
-/* FIXME: This _really_ needs to die. In 2.5, we should lock the
-   userspace buffer down and use it directly with readv/writev.
-*/
 #define MAX_KMALLOC_SIZE 0x20000
 
 static ssize_t mtd_read(struct file *file, char __user *buf, size_t count,loff_t *ppos)
@@ -187,8 +188,6 @@ static ssize_t mtd_read(struct file *file, char __user *buf, size_t count,loff_t
 	if (!count)
 		return 0;
 
-	/* FIXME: Use kiovec in 2.5 to lock down the user's buffers
-	   and pass them directly to the MTD functions */
 
 	if (count > MAX_KMALLOC_SIZE)
 		kbuf=kmalloc(MAX_KMALLOC_SIZE, GFP_KERNEL);
@@ -579,15 +578,6 @@ static int mtd_ioctl(struct file *file, u_int cmd, u_long arg)
 			erase->callback = mtdchar_erase_callback;
 			erase->priv = (unsigned long)&waitq;
 
-			/*
-			  FIXME: Allow INTERRUPTIBLE. Which means
-			  not having the wait_queue head on the stack.
-
-			  If the wq_head is on the stack, and we
-			  leave because we got interrupted, then the
-			  wq_head is no longer there when the
-			  callback routine tries to wake us up.
-			*/
 			ret = mtd->erase(mtd, erase);
 			if (!ret) {
 				set_current_state(TASK_UNINTERRUPTIBLE);
@@ -1105,6 +1095,118 @@ static void __exit cleanup_mtdchar(void)
 	unregister_filesystem(&mtd_inodefs_type);
 	__unregister_chrdev(MTD_CHAR_MAJOR, 0, 1 << MINORBITS, "mtd");
 }
+
+#if (defined R6400)
+#define NEW_DEBUG_HIDDEN_PAGE
+#endif
+/* modified start, John Ou, 12/10/2014, for new debug page */
+#ifdef KERNEL_CRASH_DUMP_TO_MTD
+
+extern char *get_logbuf(void);
+extern char *get_logsize(void);
+int flash_write_buffer()
+{
+	struct mtd_info *nvram_mtd=NULL;
+	
+	char *buffer;
+	int buf_len;
+	int len;
+
+	//nvram_mtd = get_mtd_device(NULL, 17);  //modify to use mtd17 to save crash info
+	nvram_mtd = get_mtd_device_nm("DebugMsg");  
+
+	if (!nvram_mtd) {
+		printk("%s(%d): NVRAM not found\n", __FUNCTION__, __LINE__);
+		return -ENODEV;
+	}
+#ifdef NEW_DEBUG_HIDDEN_PAGE	
+    int mtd_crash_dump_num, debug_msg_mtd_start, bitmap;
+    char buffer2[13]={0}, buffer3[75]={0};
+
+    nvram_mtd->read(nvram_mtd, 0, sizeof(buffer2)-1, &len, buffer2);
+    buffer2[sizeof(buffer2)-1] = '\0';
+    sscanf(buffer2,"%d %10d", &mtd_crash_dump_num, &debug_msg_mtd_start);
+    bitmap = debug_msg_mtd_start % 1000;
+	if(bitmap < 0)	bitmap =0;
+    debug_msg_mtd_start /= 1000;	
+    if(mtd_crash_dump_num < 1 || mtd_crash_dump_num > 9)
+    {
+        mtd_crash_dump_num = 0;
+        debug_msg_mtd_start = sizeof(buffer2)-1;
+    }
+    /* modified start, James Hsu, 2016/10/20 for Router Analytics kernel reboot timestamp */
+    /* Add timestamp for Router Analtytics kernel reboot */
+    struct timeval now;
+    struct tm tm_val;
+
+    do_gettimeofday(&now);
+    time_to_tm(now.tv_sec+AWS_timezone*3600, 0, &tm_val);
+
+    buf_len = get_logsize();
+    sprintf(buffer2,"%d %10d", ++mtd_crash_dump_num, 
+        (debug_msg_mtd_start+(sizeof(buffer3)-1)+buf_len)*1000+bitmap);
+    nvram_mtd->write(nvram_mtd, 0, sizeof(buffer2)-1, &len, buffer2);
+    sprintf(buffer3,"\n==========================Kernel crash log  %d/%d/%d %02d:%02d:%02d==============================\n",1900 + tm_val.tm_year,tm_val.tm_mon + 1,tm_val.tm_mday, tm_val.tm_hour, tm_val.tm_min,tm_val.tm_sec);
+    /* modified end, James Hsu, 2016/10/20 */
+    nvram_mtd->write(nvram_mtd, debug_msg_mtd_start, sizeof(buffer3)-1, &len, buffer3);	
+    buffer = get_logbuf();
+    nvram_mtd->write(nvram_mtd, debug_msg_mtd_start+(sizeof(buffer3)-1), 
+        buf_len, &len, buffer);
+	
+    /*
+	buf_len = get_logsize();
+    buffer = get_logbuf();
+	nvram_mtd->write(nvram_mtd, 0, buf_len, &len, buffer);
+    */
+#else
+	buf_len = get_logsize();
+    buffer = get_logbuf();
+	nvram_mtd->write(nvram_mtd, 0, buf_len, &len, buffer);
+#endif
+done:
+	return 0;
+}
+#ifdef NEW_DEBUG_HIDDEN_PAGE
+int flash_write_reboot_reason(int choice)
+{
+    struct mtd_info *nvram_mtd = NULL;
+    int len;
+    int mtd_crash_dump_num, debug_msg_mtd_start, bitmap;
+    char buffer[13]={0};
+
+    nvram_mtd = get_mtd_device_nm("DebugMsg");
+    if (!nvram_mtd) {
+        printk("%s(%d): NVRAM not found\n", __FUNCTION__, __LINE__);
+        return -ENODEV;
+    }
+    nvram_mtd->read(nvram_mtd, 0, sizeof(buffer)-1, &len, buffer);
+    buffer[sizeof(buffer)-1] = '\0';
+    sscanf(buffer,"%d %10d", &mtd_crash_dump_num, &debug_msg_mtd_start);
+    bitmap = debug_msg_mtd_start % 1000;
+	if(bitmap < 0)	bitmap = 0;
+    debug_msg_mtd_start /= 1000;
+	if(debug_msg_mtd_start < 0)	debug_msg_mtd_start = 0;
+	
+    if(bitmap == 0 || bitmap > 63)
+        bitmap = 1;
+			
+    if(!choice)    //0 for kernel crash, 1 for user manual reboot
+	    bitmap = (bitmap << 1) + 0;
+    else	
+        bitmap = (bitmap << 1) + 1;
+		
+	if(bitmap & 64)
+	{
+		bitmap = bitmap & 31;
+		bitmap |= 32;
+	}
+		
+    sprintf(buffer,"%d %10d", mtd_crash_dump_num, debug_msg_mtd_start*1000+bitmap);
+    nvram_mtd->write(nvram_mtd, 0, sizeof(buffer)-1, &len, buffer);
+}
+#endif
+#endif //KERNEL_CRASH_DUMP_TO_MTD
+/*  modified end, John Ou, 12/10/2014, for new debug page */
 
 module_init(init_mtdchar);
 module_exit(cleanup_mtdchar);

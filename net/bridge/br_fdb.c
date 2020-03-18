@@ -1,3 +1,4 @@
+/* Modified by Broadcom Corp. Portions Copyright (c) Broadcom Corp, 2012. */
 /*
  *	Forwarding database
  *	Linux ethernet bridge
@@ -24,6 +25,110 @@
 #include <asm/atomic.h>
 #include <asm/unaligned.h>
 #include "br_private.h"
+/* Foxconn added start pling 07/02/2007 */
+#define MAX_MAC_CNT     1024
+static int mac_cnt = 0; 
+/* Foxconn added end pling 07/02/2007 */
+#ifdef HNDCTF
+#include <linux/if.h>
+#include <linux/if_vlan.h>
+#include <typedefs.h>
+#include <osl.h>
+#include <ctf/hndctf.h>
+#else
+#define BCMFASTPATH_HOST
+#endif	/* HNDCTF */
+
+#ifdef HNDCTF
+static void
+br_brc_init(ctf_brc_t *brc, unsigned char *ea, struct net_device *rxdev)
+{
+	memset(brc, 0, sizeof(ctf_brc_t));
+
+	memcpy(brc->dhost.octet, ea, ETH_ALEN);
+
+        if (rxdev->priv_flags & IFF_802_1Q_VLAN) {
+		brc->txifp = (void *)vlan_dev_real_dev(rxdev);
+		brc->vid = vlan_dev_vlan_id(rxdev);
+		brc->action = ((vlan_dev_vlan_flags(rxdev) & 1) ?
+		                     CTF_ACTION_TAG : CTF_ACTION_UNTAG);
+	} else {
+		brc->txifp = (void *)rxdev;
+		brc->action = CTF_ACTION_UNTAG;
+	}
+
+#ifdef DEBUG
+	printk("mac %02x:%02x:%02x:%02x:%02x:%02x\n",
+	       brc->dhost.octet[0], brc->dhost.octet[1],
+	       brc->dhost.octet[2], brc->dhost.octet[3],
+	       brc->dhost.octet[4], brc->dhost.octet[5]);
+	printk("vid: %d action %x\n", brc->vid, brc->action);
+	printk("txif: %s\n", ((struct net_device *)brc->txifp)->name);
+#endif
+
+	return;
+}
+
+/*
+ * Add bridge cache entry.
+ */
+void
+br_brc_add(unsigned char *ea, struct net_device *rxdev)
+{
+	ctf_brc_t brc_entry, *brcp;
+
+	/* Add brc entry only if packet is received on ctf 
+	 * enabled interface
+	 */
+	if (!ctf_isenabled(kcih, ((rxdev->priv_flags & IFF_802_1Q_VLAN) ?
+	                   vlan_dev_real_dev(rxdev) : rxdev)))
+		return;
+
+	br_brc_init(&brc_entry, ea, rxdev);
+
+#ifdef DEBUG
+	printk("%s: Adding brc entry\n", __FUNCTION__);
+#endif
+
+	/* Add the bridge cache entry */
+	if ((brcp = ctf_brc_lkup(kcih, ea)) == NULL)
+		ctf_brc_add(kcih, &brc_entry);
+	else {
+		ctf_brc_release(kcih, brcp);
+		ctf_brc_update(kcih, &brc_entry);
+	}
+
+	return;
+}
+
+/*
+ * Update bridge cache entry.
+ */
+void
+br_brc_update(unsigned char *ea, struct net_device *rxdev)
+{
+	ctf_brc_t brc_entry;
+
+	/* Update brc entry only if packet is received on ctf 
+	 * enabled interface
+	 */
+	if (!ctf_isenabled(kcih, ((rxdev->priv_flags & IFF_802_1Q_VLAN) ?
+	                   vlan_dev_real_dev(rxdev) : rxdev)))
+		return;
+
+	/* Initialize the new device and/or vlan info */
+	br_brc_init(&brc_entry, ea, rxdev);
+
+#ifdef DEBUG
+	printk("%s: Updating brc entry\n", __FUNCTION__);
+#endif
+
+	/* Update the bridge cache entry */
+	ctf_brc_update(kcih, &brc_entry);
+
+	return;
+}
+#endif /* HNDCTF */
 
 static struct kmem_cache *br_fdb_cache __read_mostly;
 static int fdb_insert(struct net_bridge *br, struct net_bridge_port *source,
@@ -77,11 +182,21 @@ static void fdb_rcu_free(struct rcu_head *head)
 	struct net_bridge_fdb_entry *ent
 		= container_of(head, struct net_bridge_fdb_entry, rcu);
 	kmem_cache_free(br_fdb_cache, ent);
+	if (mac_cnt>0)
+		mac_cnt--; /* foxconn added pling 08/12/2014 */
 }
 
 static inline void fdb_delete(struct net_bridge_fdb_entry *f)
 {
 	hlist_del_rcu(&f->hlist);
+
+#ifdef HNDCTF
+	/* Delete the corresponding brc entry when it expires
+	 * or deleted by user.
+	 */
+	ctf_brc_delete(kcih, f->addr.addr);
+#endif /* HNDCTF */
+
 	call_rcu(&f->rcu, fdb_rcu_free);
 }
 
@@ -141,9 +256,27 @@ void br_fdb_cleanup(unsigned long _data)
 			if (f->is_static)
 				continue;
 			this_timer = f->ageing_timer + delay;
-			if (time_before_eq(this_timer, jiffies))
+			if (time_before_eq(this_timer, jiffies)) {
+#ifdef HNDCTF
+				ctf_brc_t *brcp;
+
+				/* Before expiring the fdb entry check the brc
+				 * live counter to make sure there are no frames
+				 * on this connection for timeout period.
+				 */
+				brcp = ctf_brc_lkup(kcih, f->addr.addr);
+				if (brcp != NULL) {
+					if (brcp->live > 0) {
+						brcp->live = 0;
+						ctf_brc_release(kcih, brcp);
+						f->ageing_timer = jiffies;
+						continue;
+					}
+					ctf_brc_release(kcih, brcp);
+				}
+#endif /* HNDCTF */
 				fdb_delete(f);
-			else if (time_before(this_timer, next_timer))
+			} else if (time_before(this_timer, next_timer))
 				next_timer = this_timer;
 		}
 	}
@@ -215,7 +348,7 @@ void br_fdb_delete_by_port(struct net_bridge *br,
 }
 
 /* No locking or refcounting, assumes caller has rcu_read_lock */
-struct net_bridge_fdb_entry *__br_fdb_get(struct net_bridge *br,
+struct net_bridge_fdb_entry * BCMFASTPATH_HOST __br_fdb_get(struct net_bridge *br,
 					  const unsigned char *addr)
 {
 	struct hlist_node *h;
@@ -322,8 +455,13 @@ static struct net_bridge_fdb_entry *fdb_create(struct hlist_head *head,
 {
 	struct net_bridge_fdb_entry *fdb;
 
+    /* foxconn wklin added start, 06/18/2008 */
+    if (mac_cnt > MAX_MAC_CNT)
+        return 0;
+    /* foxconn wklin added end, 06/18/2008 */
 	fdb = kmem_cache_alloc(br_fdb_cache, GFP_ATOMIC);
 	if (fdb) {
+        mac_cnt++; /* foxconn wklin added , 06/18/2008 */
 		memcpy(fdb->addr.addr, addr, ETH_ALEN);
 		hlist_add_head_rcu(&fdb->hlist, head);
 
@@ -331,6 +469,12 @@ static struct net_bridge_fdb_entry *fdb_create(struct hlist_head *head,
 		fdb->is_local = is_local;
 		fdb->is_static = is_local;
 		fdb->ageing_timer = jiffies;
+
+		/* Add bridge cache entry for non local hosts */
+#ifdef HNDCTF
+		if (!is_local && (source->state == BR_STATE_FORWARDING))
+			br_brc_add((unsigned char *)addr, source->dev);
+#endif /* HNDCTF */
 	}
 	return fdb;
 }
@@ -374,7 +518,7 @@ int br_fdb_insert(struct net_bridge *br, struct net_bridge_port *source,
 	return ret;
 }
 
-void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+void BCMFASTPATH_HOST br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
 		   const unsigned char *addr)
 {
 	struct hlist_head *head = &br->hash[br_mac_hash(addr)];
@@ -393,12 +537,23 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
 	if (likely(fdb)) {
 		/* attempt to update an entry for a local interface */
 		if (unlikely(fdb->is_local)) {
+#if 0   /* removed this warning message */
 			if (net_ratelimit())
 				br_warn(br, "received packet on %s with "
 					"own address as source address\n",
 					source->dev->name);
+#endif
 		} else {
 			/* fastpath: update of existing entry */
+#ifdef HNDCTF
+			/* Update the brc entry incase the host moved from
+			 * one bridge to another or to a different port under
+			 * the same bridge.
+			 */
+			if (source->state == BR_STATE_FORWARDING)
+				br_brc_update((unsigned char *)addr, source->dev);
+#endif /* HNDCTF */
+
 			fdb->dst = source;
 			fdb->ageing_timer = jiffies;
 		}

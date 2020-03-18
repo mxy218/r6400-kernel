@@ -77,6 +77,17 @@
 #ifndef SET_TSC_CTL
 # define SET_TSC_CTL(a)		(-EINVAL)
 #endif
+#if (defined R6400)
+#define NEW_DEBUG_HIDDEN_PAGE
+#endif
+
+#ifdef NEW_DEBUG_HIDDEN_PAGE
+/* Foxconn added start, John Ou, 12/10/2014, for new debug page */
+#ifdef KERNEL_CRASH_DUMP_TO_MTD
+int flash_write_reboot_reason(int);
+#endif
+/* Foxconn added end, John Ou, 12/10/2014, for new debug page */
+#endif
 
 /*
  * this is where the system-wide overflow UID and GID are defined, for
@@ -309,7 +320,16 @@ void kernel_restart(char *cmd)
 {
 	kernel_restart_prepare(cmd);
 	if (!cmd)
+	/* Foxconn modified start, John Ou, 12/10/2014, for new debug page */
+	{
+#ifdef NEW_DEBUG_HIDDEN_PAGE
+		#ifdef KERNEL_CRASH_DUMP_TO_MTD
+		flash_write_reboot_reason(1);
+		#endif
+#endif
 		printk(KERN_EMERG "Restarting system.\n");
+	}
+	/* Foxconn modifid end, John Ou, 12/10/2014, for new debug page */
 	else
 		printk(KERN_EMERG "Restarting system with command '%s'.\n", cmd);
 	machine_restart(cmd);
